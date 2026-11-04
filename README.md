@@ -11,7 +11,8 @@ chapa               bloquear
 chapa --prueba N    bloquear y abrir sola a los N segundos (para probar)
 ```
 
-Etapas: 1) bloqueo seguro con PAM (esta) · 2) wallpaper en video con libmpv,
-fluido · 3) el estilo de cada look (look.toml) y farula al abrir.
+Etapas: 1) bloqueo seguro con PAM · 2) wallpaper en video con libmpv (esta:
+fluido, con VAAPI; sin EGL/mpv, fondo sólido) · 3) el estilo de cada look y
+farula al abrir.
 
 MIT.

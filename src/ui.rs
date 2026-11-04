@@ -58,15 +58,22 @@ impl Ui {
         buf.set_string(0, 0, text, style);
         let (pw, _) = p.size(w, 1);
         let x = ((pix.width() as f32 - pw as f32 * s) / 2.0).round();
+        // sombra: el mismo texto en negro, corrido, para leerse sobre el video
+        let mut dark = buf.clone();
+        dark.set_style(dark.area, Style::new().fg(Color::Rgb(0, 0, 0)));
+        let d = (p.size(1, 1).1 as f32 * s / 16.0).max(1.5);
+        p.cells(pix, &dark, look, x + d, y + d, s);
         p.cells(pix, &buf, look, x, y, s);
     }
 
     /// Todo el cuadro de un monitor de `w`×`h` pixeles, a escala `s`.
-    pub fn draw(&mut self, w: u32, h: u32, s: f32, typed: usize, status: Status) -> Option<Pixmap> {
+    /// `over`: va encima del wallpaper (velo del color del look, para leer);
+    /// si no, fondo sólido.
+    pub fn draw(&mut self, w: u32, h: u32, s: f32, typed: usize, status: Status, over: bool) -> Option<Pixmap> {
         let mut pix = Pixmap::new(w, h)?;
         let t = self.look.theme;
         let (r, g, b) = rgb(t.base);
-        pix.fill(tiny_skia::Color::from_rgba8(r, g, b, 255));
+        pix.fill(tiny_skia::Color::from_rgba8(r, g, b, if over { 92 } else { 255 }));
 
         let hf = h as f32;
         let (_, bh) = self.big.size(1, 1);

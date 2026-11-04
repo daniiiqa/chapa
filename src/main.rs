@@ -6,6 +6,7 @@
 //!   chapa --prueba N    bloquear y abrir sola a los N segundos (para probar
 //!                       sin quedarse encerrado)
 
+mod gpu;
 mod pam;
 mod ui;
 
@@ -16,6 +17,7 @@ use smithay_client_toolkit::{
         calloop::{
             EventLoop,
             channel::{Event, Sender, channel},
+            ping::make_ping,
             timer::{TimeoutAction, Timer},
         },
         calloop_wayland_source::WaylandSource,
@@ -41,6 +43,8 @@ struct Surf {
     lock: SessionLockSurface,
     output: wl_output::WlOutput,
     size: (u32, u32),
+    /// EGL de esta superficie (con video); None: se dibuja en shm
+    target: Option<gpu::Target>,
 }
 
 struct App {
@@ -51,6 +55,7 @@ struct App {
     seats: SeatState,
     shm: Shm,
     pool: Option<SlotPool>,
+    gpu: Option<gpu::Gpu>,
     lock_state: SessionLockState,
     lock: Option<SessionLock>,
     locked: bool,
@@ -98,6 +103,7 @@ fn main() {
         seats: SeatState::new(&globals, &qh),
         shm: Shm::bind(&globals, &qh).expect("wl_shm"),
         pool: None,
+        gpu: None,
         lock_state: SessionLockState::new(&globals, &qh),
         lock: None,
         locked: false,
@@ -112,6 +118,22 @@ fn main() {
     };
     // los monitores primero, para tener una superficie por cada uno
     queue.roundtrip(&mut app).expect("roundtrip");
+
+    // el wallpaper (video o imagen) con mpv sobre EGL; sin eso, fondo sólido
+    let (ping, ping_src) = make_ping().expect("ping");
+    let source = gpu::wallpaper();
+    app.gpu = gpu::Gpu::new(conn.backend().display_ptr() as *mut std::ffi::c_void, &source, ping);
+    if app.gpu.is_none() {
+        eprintln!("chapa: sin EGL/mpv, fondo sólido");
+    }
+    event_loop
+        .handle()
+        .insert_source(ping_src, |_, _, app| {
+            if app.gpu.as_ref().is_some_and(|g| g.new_frame()) {
+                app.present_all();
+            }
+        })
+        .expect("cuadros de mpv");
 
     let Ok(lock) = app.lock_state.lock(&qh) else {
         eprintln!("chapa: el compositor no tiene ext-session-lock");
@@ -173,7 +195,7 @@ impl App {
         let Some(lock) = self.lock.as_ref() else { return };
         let surface = self.compositor.create_surface(qh);
         let lock = lock.create_lock_surface(surface, &output, qh);
-        self.surfaces.push(Surf { lock, output, size: (0, 0) });
+        self.surfaces.push(Surf { lock, output, size: (0, 0), target: None });
     }
 
     fn scale(&self, output: &wl_output::WlOutput) -> i32 {
@@ -187,7 +209,23 @@ impl App {
         }
         let scale = self.scale(&self.surfaces[i].output);
         let (bw, bh) = (w * scale as u32, h * scale as u32);
-        let Some(pix) = self.ui.draw(bw, bh, scale as f32, self.pass.chars().count(), self.status) else { return };
+        let typed = self.pass.chars().count();
+        if let Some(gpu) = self.gpu.as_ref() {
+            let surf = &mut self.surfaces[i];
+            surf.lock.wl_surface().set_buffer_scale(scale);
+            match surf.target.as_mut() {
+                Some(t) => gpu.resize(t, bw as i32, bh as i32),
+                None => surf.target = gpu.target(surf.lock.wl_surface(), bw as i32, bh as i32),
+            }
+            if let Some(t) = surf.target.as_mut()
+                && let Some(pix) = self.ui.draw(bw, bh, scale as f32, typed, self.status, true)
+            {
+                gpu.upload(t, pix.data(), bw as i32, bh as i32);
+                gpu.present(t);
+                return;
+            }
+        }
+        let Some(pix) = self.ui.draw(bw, bh, scale as f32, typed, self.status, false) else { return };
         let pool = self.pool.get_or_insert_with(|| SlotPool::new((bw * bh * 4) as usize, &self.shm).expect("shm"));
         let Ok((buffer, canvas)) = pool.create_buffer(bw as i32, bh as i32, bw as i32 * 4, wl_shm::Format::Argb8888) else { return };
         // tiny-skia: RGBA premultiplicado → ARGB8888 (en memoria: B G R A)
@@ -199,6 +237,16 @@ impl App {
         if buffer.attach_to(surf).is_ok() {
             surf.damage_buffer(0, 0, bw as i32, bh as i32);
             surf.commit();
+        }
+    }
+
+    /// Un cuadro nuevo del wallpaper en cada superficie (la capa de texto no cambia).
+    fn present_all(&mut self) {
+        let Some(gpu) = self.gpu.as_ref() else { return };
+        for s in &self.surfaces {
+            if let Some(t) = &s.target {
+                gpu.present(t);
+            }
         }
     }
 

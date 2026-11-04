@@ -1,0 +1,281 @@
+//! El fondo en video: EGL en cada superficie de la chapa, mpv (libmpv, la
+//! misma tripa que mpvpaper) pinta el wallpaper (video o imagen) y encima va
+//! la capa de la hora y la contraseña (una textura que solo se sube cuando
+//! cambia). Si algo de esto falla, main usa el dibujo en memoria (shm).
+
+use glow::HasContext;
+use khronos_egl as egl;
+use std::ffi::{CString, c_char, c_int, c_void};
+use std::ptr;
+use wayland_client::Proxy;
+use wayland_client::protocol::wl_surface::WlSurface;
+use wayland_egl::WlEglSurface;
+
+// ─── libmpv ─────────────────────────────────────────────────────────────────
+
+#[repr(C)]
+struct Param {
+    kind: c_int,
+    data: *mut c_void,
+}
+
+#[repr(C)]
+struct GlInit {
+    get_proc_address: extern "C" fn(*mut c_void, *const c_char) -> *mut c_void,
+    ctx: *mut c_void,
+}
+
+#[repr(C)]
+struct Fbo {
+    fbo: c_int,
+    w: c_int,
+    h: c_int,
+    internal_format: c_int,
+}
+
+const P_INVALID: c_int = 0;
+const P_API_TYPE: c_int = 1;
+const P_GL_INIT: c_int = 2;
+const P_FBO: c_int = 3;
+const P_FLIP_Y: c_int = 4;
+const P_WL_DISPLAY: c_int = 9;
+const UPDATE_FRAME: u64 = 1;
+
+#[link(name = "mpv")]
+unsafe extern "C" {
+    fn mpv_create() -> *mut c_void;
+    fn mpv_initialize(h: *mut c_void) -> c_int;
+    fn mpv_set_option_string(h: *mut c_void, name: *const c_char, value: *const c_char) -> c_int;
+    fn mpv_command(h: *mut c_void, args: *mut *const c_char) -> c_int;
+    fn mpv_render_context_create(out: *mut *mut c_void, h: *mut c_void, params: *mut Param) -> c_int;
+    fn mpv_render_context_set_update_callback(ctx: *mut c_void, cb: extern "C" fn(*mut c_void), data: *mut c_void);
+    fn mpv_render_context_update(ctx: *mut c_void) -> u64;
+    fn mpv_render_context_render(ctx: *mut c_void, params: *mut Param) -> c_int;
+    fn mpv_render_context_report_swap(ctx: *mut c_void);
+}
+
+static EGL: egl::Instance<egl::Static> = egl::Instance::new(egl::Static);
+
+extern "C" fn proc_address(_: *mut c_void, name: *const c_char) -> *mut c_void {
+    let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_str().unwrap_or("");
+    EGL.get_proc_address(name).map_or(ptr::null_mut(), |f| f as *mut c_void)
+}
+
+/// mpv avisa desde su hilo que hay cuadro nuevo: despertar el loop.
+extern "C" fn on_update(data: *mut c_void) {
+    let ping = unsafe { &*(data as *const smithay_client_toolkit::reexports::calloop::ping::Ping) };
+    ping.ping();
+}
+
+// ─── GL ─────────────────────────────────────────────────────────────────────
+
+const VS: &str = "attribute vec2 p; varying vec2 uv;
+void main() { uv = vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5); gl_Position = vec4(p, 0.0, 1.0); }";
+const FS: &str = "precision mediump float; uniform sampler2D t; varying vec2 uv;
+void main() { gl_FragColor = texture2D(t, uv); }";
+
+/// Una superficie de la chapa con su EGL y su capa de texto.
+pub struct Target {
+    win: WlEglSurface,
+    surf: egl::Surface,
+    size: (i32, i32),
+    tex: Option<glow::Texture>,
+}
+
+pub struct Gpu {
+    display: egl::Display,
+    config: egl::Config,
+    context: egl::Context,
+    gl: glow::Context,
+    prog: glow::Program,
+    vbo: glow::Buffer,
+    /// el reproductor (vive lo que vive la chapa)
+    _mpv: *mut c_void,
+    render: *mut c_void,
+}
+
+impl Gpu {
+    /// EGL sobre la conexión de Wayland y mpv con `source` (video o imagen).
+    /// `ping` despierta el loop cuando mpv tiene cuadro nuevo.
+    pub fn new(wl_display: *mut c_void, source: &str, ping: smithay_client_toolkit::reexports::calloop::ping::Ping) -> Option<Gpu> {
+        unsafe {
+            let display = EGL.get_display(wl_display as egl::NativeDisplayType)?;
+            EGL.initialize(display).ok()?;
+            EGL.bind_api(egl::OPENGL_ES_API).ok()?;
+            let attrs = [
+                egl::RED_SIZE, 8, egl::GREEN_SIZE, 8, egl::BLUE_SIZE, 8, egl::ALPHA_SIZE, 8,
+                egl::SURFACE_TYPE, egl::WINDOW_BIT, egl::RENDERABLE_TYPE, egl::OPENGL_ES2_BIT, egl::NONE,
+            ];
+            let config = EGL.choose_first_config(display, &attrs).ok()??;
+            let context = EGL
+                .create_context(display, config, None, &[egl::CONTEXT_MAJOR_VERSION, 3, egl::NONE])
+                .or_else(|_| EGL.create_context(display, config, None, &[egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE]))
+                .ok()?;
+            // sin superficie todavía: el contexto se puede hacer actual solo
+            EGL.make_current(display, None, None, Some(context)).ok()?;
+            let gl = glow::Context::from_loader_function(|s| EGL.get_proc_address(s).map_or(ptr::null(), |f| f as *const c_void));
+
+            let prog = gl.create_program().ok()?;
+            for (kind, src) in [(glow::VERTEX_SHADER, VS), (glow::FRAGMENT_SHADER, FS)] {
+                let sh = gl.create_shader(kind).ok()?;
+                gl.shader_source(sh, src);
+                gl.compile_shader(sh);
+                if !gl.get_shader_compile_status(sh) {
+                    eprintln!("chapa: shader: {}", gl.get_shader_info_log(sh));
+                    return None;
+                }
+                gl.attach_shader(prog, sh);
+            }
+            gl.bind_attrib_location(prog, 0, "p");
+            gl.link_program(prog);
+            if !gl.get_program_link_status(prog) {
+                return None;
+            }
+            let vbo = gl.create_buffer().ok()?;
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+            let quad: [f32; 8] = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
+            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, std::slice::from_raw_parts(quad.as_ptr() as *const u8, 32), glow::STATIC_DRAW);
+
+            // mpv: sin audio, en loop, llenando la pantalla como mpvpaper
+            let mpv = mpv_create();
+            if mpv.is_null() {
+                return None;
+            }
+            for (k, v) in [
+                ("vo", "libmpv"), ("hwdec", "auto-safe"), ("audio", "no"), ("loop-file", "inf"), ("keep-open", "yes"),
+                ("image-display-duration", "inf"), ("panscan", "1.0"), ("terminal", "no"), ("config", "no"),
+                ("load-scripts", "no"), ("osc", "no"), ("input-default-bindings", "no"), ("idle", "yes"),
+            ] {
+                let (k, v) = (CString::new(k).unwrap(), CString::new(v).unwrap());
+                mpv_set_option_string(mpv, k.as_ptr(), v.as_ptr());
+            }
+            if mpv_initialize(mpv) < 0 {
+                return None;
+            }
+            let api = CString::new("opengl").unwrap();
+            let mut init = GlInit { get_proc_address: proc_address, ctx: ptr::null_mut() };
+            let mut params = [
+                Param { kind: P_API_TYPE, data: api.as_ptr() as *mut c_void },
+                Param { kind: P_GL_INIT, data: &mut init as *mut GlInit as *mut c_void },
+                Param { kind: P_WL_DISPLAY, data: wl_display },
+                Param { kind: P_INVALID, data: ptr::null_mut() },
+            ];
+            let mut render = ptr::null_mut();
+            if mpv_render_context_create(&mut render, mpv, params.as_mut_ptr()) < 0 {
+                eprintln!("chapa: mpv no pudo usar OpenGL");
+                return None;
+            }
+            let ping = Box::into_raw(Box::new(ping));
+            mpv_render_context_set_update_callback(render, on_update, ping as *mut c_void);
+            let cmd = [CString::new("loadfile").unwrap(), CString::new(source).ok()?];
+            let mut argv: Vec<*const c_char> = cmd.iter().map(|c| c.as_ptr()).collect();
+            argv.push(ptr::null());
+            mpv_command(mpv, argv.as_mut_ptr());
+            Some(Gpu { display, config, context, gl, prog, vbo, _mpv: mpv, render })
+        }
+    }
+
+    pub fn target(&self, surface: &WlSurface, w: i32, h: i32) -> Option<Target> {
+        let win = WlEglSurface::new(surface.id(), w, h).ok()?;
+        let surf = unsafe { EGL.create_window_surface(self.display, self.config, win.ptr() as egl::NativeWindowType, None).ok()? };
+        Some(Target { win, surf, size: (w, h), tex: None })
+    }
+
+    pub fn resize(&self, t: &mut Target, w: i32, h: i32) {
+        if t.size != (w, h) {
+            t.win.resize(w, h, 0, 0);
+            t.size = (w, h);
+        }
+    }
+
+    /// ¿Tiene mpv un cuadro nuevo? (después de que avisó)
+    pub fn new_frame(&self) -> bool {
+        unsafe { mpv_render_context_update(self.render) & UPDATE_FRAME != 0 }
+    }
+
+    /// Sube la capa de texto (RGBA premultiplicado, del tamaño de la superficie).
+    pub fn upload(&self, t: &mut Target, rgba: &[u8], w: i32, h: i32) {
+        let gl = &self.gl;
+        unsafe {
+            if EGL.make_current(self.display, Some(t.surf), Some(t.surf), Some(self.context)).is_err() {
+                return;
+            }
+            let tex = match t.tex {
+                Some(x) => x,
+                None => {
+                    let Ok(x) = gl.create_texture() else { return };
+                    gl.bind_texture(glow::TEXTURE_2D, Some(x));
+                    for p in [glow::TEXTURE_MIN_FILTER, glow::TEXTURE_MAG_FILTER] {
+                        gl.tex_parameter_i32(glow::TEXTURE_2D, p, glow::LINEAR as i32);
+                    }
+                    for p in [glow::TEXTURE_WRAP_S, glow::TEXTURE_WRAP_T] {
+                        gl.tex_parameter_i32(glow::TEXTURE_2D, p, glow::CLAMP_TO_EDGE as i32);
+                    }
+                    t.tex = Some(x);
+                    x
+                }
+            };
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+            gl.tex_image_2d(
+                glow::TEXTURE_2D, 0, glow::RGBA as i32, w, h, 0, glow::RGBA, glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(rgba)),
+            );
+        }
+    }
+
+    /// Un cuadro: el wallpaper de mpv y la capa de texto encima.
+    pub fn present(&self, t: &Target) {
+        let gl = &self.gl;
+        let (w, h) = t.size;
+        unsafe {
+            if EGL.make_current(self.display, Some(t.surf), Some(t.surf), Some(self.context)).is_err() {
+                return;
+            }
+            let _ = EGL.swap_interval(self.display, 0);
+            let mut fbo = Fbo { fbo: 0, w, h, internal_format: 0 };
+            let mut flip: c_int = 1;
+            let mut params = [
+                Param { kind: P_FBO, data: &mut fbo as *mut Fbo as *mut c_void },
+                Param { kind: P_FLIP_Y, data: &mut flip as *mut c_int as *mut c_void },
+                Param { kind: P_INVALID, data: ptr::null_mut() },
+            ];
+            mpv_render_context_render(self.render, params.as_mut_ptr());
+            // mpv deja el estado de GL a su gusto: ponerlo todo de nuevo
+            if let Some(tex) = t.tex {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                gl.viewport(0, 0, w, h);
+                gl.use_program(Some(self.prog));
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
+                gl.enable_vertex_attrib_array(0);
+                gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 0, 0);
+                gl.active_texture(glow::TEXTURE0);
+                gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                gl.enable(glow::BLEND);
+                gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+                gl.disable(glow::BLEND);
+            }
+            let _ = EGL.swap_buffers(self.display, t.surf);
+            mpv_render_context_report_swap(self.render);
+        }
+    }
+}
+
+/// Lo que va de fondo: el video de mpvpaper (livewallpaper.conf) si hay; si
+/// no, la imagen del wallpaper (la que deja WallustSwww).
+pub fn wallpaper() -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let live = std::fs::read_to_string(format!("{home}/.config/hypr/conf/livewallpaper.conf")).unwrap_or_default();
+    let video = live.lines().filter(|l| l.trim_start().starts_with("exec-once") && l.contains("mpvpaper")).find_map(|l| {
+        let q: Vec<&str> = l.split('"').collect();
+        q.iter().rev().find(|s| {
+            let s = s.to_lowercase();
+            [".mp4", ".webm", ".mkv", ".mov", ".m4v", ".avi"].iter().any(|e| s.ends_with(e))
+        }).map(|s| s.replace("$HOME", &home))
+    });
+    match video {
+        Some(v) if std::path::Path::new(&v).exists() => v,
+        _ => format!("{home}/.config/hypr/wallpaper_effects/.wallpaper_current"),
+    }
+}
