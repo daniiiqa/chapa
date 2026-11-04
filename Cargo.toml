@@ -1,0 +1,18 @@
+[package]
+name = "chapa"
+version = "0.1.0"
+edition = "2024"
+description = "La chapa de discada: bloquea la sesión (ext-session-lock) con el look del rice"
+license = "MIT"
+
+[dependencies]
+smithay-client-toolkit = "0.21"
+wayland-client = "0.31"
+disco = { git = "https://github.com/daniiiqa/disco", features = ["paint"] }
+ratatui = "0.29"
+tiny-skia = "0.12"
+libc = "0.2"
+
+[profile.release]
+lto = true
+strip = true
