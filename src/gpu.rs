@@ -86,14 +86,36 @@ void main() { uv = vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5); gl_Position = vec4(p,
 const FS: &str = "precision mediump float; uniform sampler2D t; varying vec2 uv;
 void main() { gl_FragColor = texture2D(t, uv); }";
 
+/// Para el blur, de textura a textura: sin voltear (VS voltea, para la pantalla).
+const VS_PLANO: &str = "attribute vec2 p; varying vec2 uv;
+void main() { uv = p * 0.5 + 0.5; gl_Position = vec4(p, 0.0, 1.0); }";
+/// Una pasada de gaussiano de 9 muestras (5 lecturas con filtro lineal) en la
+/// dirección `d` (en coordenadas de textura).
+const FS_BLUR: &str = "precision mediump float; uniform sampler2D t; uniform vec2 d; varying vec2 uv;
+void main() {
+  vec4 c = texture2D(t, uv) * 0.2270270270;
+  c += (texture2D(t, uv + d * 1.3846153846) + texture2D(t, uv - d * 1.3846153846)) * 0.3162162162;
+  c += (texture2D(t, uv + d * 3.2307692308) + texture2D(t, uv - d * 3.2307692308)) * 0.0702702703;
+  gl_FragColor = c;
+}";
+
+/// Lo del blur de una superficie: dos texturas chicas para ir y venir.
+#[derive(Clone, Copy)]
+struct Chico {
+    a: (glow::Framebuffer, glow::Texture),
+    b: (glow::Framebuffer, glow::Texture),
+    w: i32,
+    h: i32,
+}
+
 /// Una superficie de la chapa con su EGL y su capa de texto.
 pub struct Target {
     win: WlEglSurface,
     surf: egl::Surface,
     size: (i32, i32),
     tex: Option<glow::Texture>,
-    /// con blur: el video se dibuja aquí en chico y se estira (framebuffer, textura, tamaño)
-    chico: std::cell::Cell<Option<(glow::Framebuffer, glow::Texture, i32, i32)>>,
+    /// con blur: el video en chico, desenfocado ahí y luego estirado
+    chico: std::cell::Cell<Option<Chico>>,
 }
 
 pub struct Gpu {
@@ -106,8 +128,31 @@ pub struct Gpu {
     /// el reproductor (vive lo que vive la chapa)
     _mpv: *mut c_void,
     render: *mut c_void,
-    /// el blur del look (blur_size × blur_passes de su hyprlock.conf)
-    blur: std::cell::Cell<f32>,
+    /// el blur del look (blur_size y blur_passes de su hyprlock.conf)
+    blur_tam: std::cell::Cell<f32>,
+    blur_pasadas: std::cell::Cell<u32>,
+    /// el shader del blur y su uniforme `d`; None si no compiló (sin blur)
+    blur_prog: Option<(glow::Program, Option<glow::UniformLocation>)>,
+}
+
+/// Un programa de dos shaders, con el atributo `p` en 0.
+unsafe fn programa(gl: &glow::Context, vs: &str, fs: &str) -> Option<glow::Program> {
+    unsafe {
+        let prog = gl.create_program().ok()?;
+        for (kind, src) in [(glow::VERTEX_SHADER, vs), (glow::FRAGMENT_SHADER, fs)] {
+            let sh = gl.create_shader(kind).ok()?;
+            gl.shader_source(sh, src);
+            gl.compile_shader(sh);
+            if !gl.get_shader_compile_status(sh) {
+                di!("shader: {}", gl.get_shader_info_log(sh));
+                return None;
+            }
+            gl.attach_shader(prog, sh);
+        }
+        gl.bind_attrib_location(prog, 0, "p");
+        gl.link_program(prog);
+        gl.get_program_link_status(prog).then_some(prog)
+    }
 }
 
 impl Gpu {
@@ -131,22 +176,9 @@ impl Gpu {
             EGL.make_current(display, None, None, Some(context)).ok()?;
             let gl = glow::Context::from_loader_function(|s| EGL.get_proc_address(s).map_or(ptr::null(), |f| f as *const c_void));
 
-            let prog = gl.create_program().ok()?;
-            for (kind, src) in [(glow::VERTEX_SHADER, VS), (glow::FRAGMENT_SHADER, FS)] {
-                let sh = gl.create_shader(kind).ok()?;
-                gl.shader_source(sh, src);
-                gl.compile_shader(sh);
-                if !gl.get_shader_compile_status(sh) {
-                    di!("shader: {}", gl.get_shader_info_log(sh));
-                    return None;
-                }
-                gl.attach_shader(prog, sh);
-            }
-            gl.bind_attrib_location(prog, 0, "p");
-            gl.link_program(prog);
-            if !gl.get_program_link_status(prog) {
-                return None;
-            }
+            let prog = programa(&gl, VS, FS)?;
+            // el del blur es opcional: si no compila, la chapa va sin blur
+            let blur_prog = programa(&gl, VS_PLANO, FS_BLUR).map(|p| (p, gl.get_uniform_location(p, "d")));
             let vbo = gl.create_buffer().ok()?;
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
             let quad: [f32; 8] = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
@@ -197,7 +229,19 @@ impl Gpu {
             let mut argv: Vec<*const c_char> = cmd.iter().map(|c| c.as_ptr()).collect();
             argv.push(ptr::null());
             mpv_command(mpv, argv.as_mut_ptr());
-            Some(Gpu { display, config, context, gl, prog, vbo, _mpv: mpv, render, blur: std::cell::Cell::new(0.0) })
+            Some(Gpu {
+                display,
+                config,
+                context,
+                gl,
+                prog,
+                vbo,
+                _mpv: mpv,
+                render,
+                blur_tam: std::cell::Cell::new(0.0),
+                blur_pasadas: std::cell::Cell::new(0),
+                blur_prog,
+            })
         }
     }
 
@@ -280,36 +324,23 @@ impl Gpu {
         Some((w as u32, h as u32, rgb))
     }
 
-    /// El blur del look: blur_size × blur_passes de hyprlock (0: nítido).
-    pub fn set_blur(&self, blur: f32) {
-        self.blur.set(blur.max(0.0));
+    /// El blur del look: blur_size y blur_passes de hyprlock (0 pasadas: nítido).
+    pub fn set_blur(&self, tam: f32, pasadas: u32) {
+        self.blur_tam.set(tam.max(0.0));
+        self.blur_pasadas.set(pasadas.min(8));
     }
 
-    /// Cuánto más chico se dibuja el video para desenfocarlo (1: nada).
+    /// A qué fracción se desenfoca: un blur fuerte en un cuarto (ya borroso, al
+    /// estirarlo no se ven cuadritos), uno ligero a la mitad.
     fn factor(&self) -> i32 {
-        let b = self.blur.get();
-        if b <= 0.0 { 1 } else { (1.0 + b / 3.0).round().clamp(2.0, 12.0) as i32 }
+        let fuerza = self.blur_tam.get() * (self.blur_pasadas.get() as f32).sqrt();
+        if fuerza >= 8.0 { 4 } else { 2 }
     }
 
-    /// El framebuffer chico de `t` para el blur (lo crea o lo rehace si cambió
-    /// el tamaño). None: sin blur, o la GPU no pudo.
-    fn chico(&self, t: &Target) -> Option<(glow::Framebuffer, glow::Texture, i32, i32)> {
-        let k = self.factor();
-        if k <= 1 {
-            return None;
-        }
-        let (cw, ch) = ((t.size.0 / k).max(1), (t.size.1 / k).max(1));
-        if let Some(c) = t.chico.get()
-            && (c.2, c.3) == (cw, ch)
-        {
-            return Some(c);
-        }
+    /// Una textura con su framebuffer, del tamaño dado, con filtro lineal.
+    unsafe fn textura(&self, w: i32, h: i32) -> Option<(glow::Framebuffer, glow::Texture)> {
         let gl = &self.gl;
         unsafe {
-            if let Some((fb, tex, _, _)) = t.chico.take() {
-                gl.delete_framebuffer(fb);
-                gl.delete_texture(tex);
-            }
             let tex = gl.create_texture().ok()?;
             gl.bind_texture(glow::TEXTURE_2D, Some(tex));
             for p in [glow::TEXTURE_MIN_FILTER, glow::TEXTURE_MAG_FILTER] {
@@ -318,22 +349,78 @@ impl Gpu {
             for p in [glow::TEXTURE_WRAP_S, glow::TEXTURE_WRAP_T] {
                 gl.tex_parameter_i32(glow::TEXTURE_2D, p, glow::CLAMP_TO_EDGE as i32);
             }
-            gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA as i32, cw, ch, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
+            gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA as i32, w, h, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
             let fb = gl.create_framebuffer().ok()?;
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fb));
             gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(tex), 0);
             let ok = gl.check_framebuffer_status(glow::FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE;
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-            if !ok {
-                di!("gpu: el framebuffer del blur no quedó; sin blur");
+            if ok {
+                Some((fb, tex))
+            } else {
                 gl.delete_framebuffer(fb);
                 gl.delete_texture(tex);
-                self.blur.set(0.0);
-                return None;
+                None
             }
-            di!("gpu: blur ×{k} ({cw}x{ch})");
-            t.chico.set(Some((fb, tex, cw, ch)));
-            Some((fb, tex, cw, ch))
+        }
+    }
+
+    /// Las texturas chicas de `t` para el blur (las crea o las rehace si cambió
+    /// el tamaño). None: sin blur, o la GPU no pudo.
+    fn chico(&self, t: &Target) -> Option<Chico> {
+        if self.blur_pasadas.get() == 0 || self.blur_prog.is_none() {
+            return None;
+        }
+        let k = self.factor();
+        let (cw, ch) = ((t.size.0 / k).max(1), (t.size.1 / k).max(1));
+        if let Some(c) = t.chico.get()
+            && (c.w, c.h) == (cw, ch)
+        {
+            return Some(c);
+        }
+        let gl = &self.gl;
+        unsafe {
+            if let Some(c) = t.chico.take() {
+                for (fb, tex) in [c.a, c.b] {
+                    gl.delete_framebuffer(fb);
+                    gl.delete_texture(tex);
+                }
+            }
+            let (Some(a), Some(b)) = (self.textura(cw, ch), self.textura(cw, ch)) else {
+                di!("gpu: las texturas del blur no quedaron; sin blur");
+                self.blur_pasadas.set(0);
+                return None;
+            };
+            di!("gpu: blur {} pasadas a 1/{k} ({cw}x{ch})", self.blur_pasadas.get());
+            let c = Chico { a, b, w: cw, h: ch };
+            t.chico.set(Some(c));
+            Some(c)
+        }
+    }
+
+    /// Desenfoca lo que hay en `c.a` (ida y vuelta por `c.b`), en su lugar.
+    unsafe fn desenfocar(&self, c: &Chico) {
+        let Some((prog, d)) = &self.blur_prog else { return };
+        let gl = &self.gl;
+        // qué tan lejos toma cada muestra, en texeles de la textura chica: el
+        // blur_size de hyprlock está en pixeles de pantalla
+        let paso = (self.blur_tam.get() / self.factor() as f32 * 0.8).max(0.5);
+        unsafe {
+            gl.use_program(Some(*prog));
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
+            gl.enable_vertex_attrib_array(0);
+            gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 0, 0);
+            gl.active_texture(glow::TEXTURE0);
+            gl.disable(glow::BLEND);
+            gl.viewport(0, 0, c.w, c.h);
+            for _ in 0..self.blur_pasadas.get() {
+                for (de, a, dir) in [(c.a, c.b, (paso / c.w as f32, 0.0)), (c.b, c.a, (0.0, paso / c.h as f32))] {
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(a.0));
+                    gl.bind_texture(glow::TEXTURE_2D, Some(de.1));
+                    gl.uniform_2_f32(d.as_ref(), dir.0, dir.1);
+                    gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+                }
+            }
         }
     }
 
@@ -348,24 +435,25 @@ impl Gpu {
                 return None;
             }
             let _ = EGL.swap_interval(self.display, 0);
-            // con blur, mpv dibuja en chico (en una textura) y luego se estira
-            // con filtro lineal: un desenfoque suave casi gratis
+            // con blur: mpv dibuja en chico, se desenfoca ahí y se estira
             let chico = self.chico(t);
             let (destino, dw, dh) = match chico {
-                Some((fb, _, cw, ch)) => (fb.0.get() as c_int, cw, ch),
+                Some(c) => (c.a.0.0.get() as c_int, c.w, c.h),
                 None => (0, w, h),
             };
             let mut fbo = Fbo { fbo: destino, w: dw, h: dh, internal_format: 0 };
-            // con flip, la fila de arriba de la imagen queda en la fila 0: así la
-            // muestra bien el framebuffer de la pantalla y también el shader
-            let mut flip: c_int = 1;
+            // a la pantalla (framebuffer 0) mpv va volteado; a una textura no:
+            // el shader de la pantalla ya voltea al estirarla
+            let mut flip: c_int = if chico.is_some() { 0 } else { 1 };
             let mut params = [
                 Param { kind: P_FBO, data: &mut fbo as *mut Fbo as *mut c_void },
                 Param { kind: P_FLIP_Y, data: &mut flip as *mut c_int as *mut c_void },
                 Param { kind: P_INVALID, data: ptr::null_mut() },
             ];
             let r = mpv_render_context_render(self.render, params.as_mut_ptr());
-            if let Some((_, tex, _, _)) = chico {
+            if let Some(c) = chico {
+                self.desenfocar(&c);
+                let tex = c.a.1;
                 gl.bind_framebuffer(glow::FRAMEBUFFER, None);
                 gl.viewport(0, 0, w, h);
                 gl.use_program(Some(self.prog));

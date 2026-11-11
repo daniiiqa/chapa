@@ -109,8 +109,9 @@ pub fn correr(args: &[String]) -> i32 {
     let wall = format!("{home}/.config/hypr/wallpaper_effects/.wallpaper_current");
     let mut cmd = Command::new("magick");
     cmd.arg(format!("{wall}[0]")).args(["-resize", &format!("{w}x{h}^"), "-gravity", "center", "-extent", &format!("{w}x{h}")]);
-    if estilo.fondo.blur > 0.0 {
-        cmd.args(["-blur", &format!("0x{}", estilo.fondo.blur * 0.6)]);
+    if estilo.fondo.blur_pasadas > 0 {
+        let sigma = estilo.fondo.blur_tam * (estilo.fondo.blur_pasadas as f32).sqrt();
+        cmd.args(["-blur", &format!("0x{sigma}")]);
     }
     let fondo = cmd.arg("ppm:-").output().ok().and_then(|o| ppm(&o.stdout));
 

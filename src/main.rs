@@ -166,7 +166,7 @@ fn main() {
     di!("estilo: {}", if app.lienzo.is_some() { "el del look (hyprlock.conf)" } else { "el de siempre" });
     app.gpu = gpu::Gpu::new(conn.backend().display_ptr() as *mut std::ffi::c_void, &source, ping);
     if let (Some(g), Some(l)) = (app.gpu.as_ref(), app.lienzo.as_ref()) {
-        g.set_blur(l.estilo.fondo.blur);
+        g.set_blur(l.estilo.fondo.blur_tam, l.estilo.fondo.blur_pasadas);
     }
     if app.gpu.is_none() {
         di!("sin EGL/mpv, fondo sólido");

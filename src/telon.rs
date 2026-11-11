@@ -76,6 +76,12 @@ pub fn poner(w: u32, h: u32, rgb: &[u8]) -> bool {
             }
         }
     };
+    // con ~/.local/state/chapa/debug, una copia del último cuadro (para ver
+    // qué se vio sin poder capturar la pantalla bloqueada)
+    let estado = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state/chapa"));
+    if let Some(e) = estado.filter(|e| e.join("debug").exists()) {
+        let _ = std::fs::copy(&img, e.join("ultimo.ppm"));
+    }
     // farula ya la leyó (o no va a salir)
     let _ = std::fs::remove_file(&img);
     puesto

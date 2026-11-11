@@ -120,8 +120,10 @@ pub struct Fondo {
     pub color: Color,
     /// 1 = como está; hyprlock multiplica la imagen por esto
     pub brillo: f32,
-    /// blur_size × blur_passes (0: sin desenfoque)
-    pub blur: f32,
+    /// blur_size de hyprlock: qué tan lejos toma cada pasada
+    pub blur_tam: f32,
+    /// blur_passes (0: sin desenfoque)
+    pub blur_pasadas: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -336,7 +338,7 @@ const BLANCO: Color = [1.0, 1.0, 1.0, 1.0];
 const NEGRO: Color = [0.0, 0.0, 0.0, 1.0];
 
 fn armar(bloques: Vec<Bloque>) -> Option<Estilo> {
-    let mut fondo = Fondo { color: NEGRO, brillo: 0.8172, blur: 0.0 };
+    let mut fondo = Fondo { color: NEGRO, brillo: 0.8172, blur_tam: 8.0, blur_pasadas: 0 };
     let mut cosas: Vec<(i32, Cosa)> = Vec::new();
     for b in bloques {
         match b.nombre.as_str() {
@@ -344,7 +346,8 @@ fn armar(bloques: Vec<Bloque>) -> Option<Estilo> {
                 fondo = Fondo {
                     color: b.color("color", NEGRO),
                     brillo: b.f("brightness", 0.8172).clamp(0.0, 2.0),
-                    blur: b.f("blur_size", 8.0) * b.f("blur_passes", 0.0),
+                    blur_tam: b.f("blur_size", 8.0).max(0.0),
+                    blur_pasadas: b.f("blur_passes", 0.0).max(0.0) as u32,
                 }
             }
             "label" => {
@@ -515,7 +518,7 @@ input-field {
 }
 "#);
         assert_eq!(e.fondo.brillo, 0.62);
-        assert_eq!(e.fondo.blur, 8.0);
+        assert_eq!((e.fondo.blur_tam, e.fondo.blur_pasadas), (4.0, 2));
         assert_eq!(e.cosas.len(), 2);
         // zindex: la entrada (0) antes que la etiqueta (2)
         let Cosa::Entrada(i) = &e.cosas[0] else { panic!() };
