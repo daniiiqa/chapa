@@ -19,6 +19,16 @@ pub enum Status {
     Wrong,
 }
 
+/// Lo que dice la línea de la contraseña.
+#[derive(Clone, Copy)]
+pub struct Prompt {
+    /// letras escritas
+    pub typed: usize,
+    pub status: Status,
+    /// el lector está escuchando (se puede abrir con la huella)
+    pub dedo: bool,
+}
+
 pub struct Ui {
     pub look: Look,
     big: Painter,
@@ -69,7 +79,7 @@ impl Ui {
     /// Todo el cuadro de un monitor de `w`×`h` pixeles, a escala `s`.
     /// `over`: va encima del wallpaper (velo del color del look, para leer);
     /// si no, fondo sólido.
-    pub fn draw(&mut self, w: u32, h: u32, s: f32, typed: usize, status: Status, over: bool) -> Option<Pixmap> {
+    pub fn draw(&mut self, w: u32, h: u32, s: f32, p: Prompt, over: bool) -> Option<Pixmap> {
         let mut pix = Pixmap::new(w, h)?;
         let t = self.look.theme;
         let (r, g, b) = rgb(t.base);
@@ -83,9 +93,11 @@ impl Ui {
         Ui::line(&mut self.small, &mut pix, &self.look, &date, Style::new().fg(t.muted), top + bh as f32 * s, s);
 
         // la contraseña: un punto por letra (máximo 24), o lo que está pasando
+        let Prompt { typed, status, dedo } = p;
         let (text, style) = match status {
             Status::Checking => ("…".to_string(), Style::new().fg(t.primary)),
             Status::Wrong if typed == 0 => ("no · otra vez".to_string(), Style::new().fg(t.red)),
+            _ if typed == 0 && dedo => ("contraseña o huella".to_string(), Style::new().fg(t.muted)),
             _ if typed == 0 => ("contraseña".to_string(), Style::new().fg(t.muted)),
             _ => ("● ".repeat(typed.min(24)).trim_end().to_string(), Style::new().fg(t.accent)),
         };

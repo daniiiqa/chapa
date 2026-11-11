@@ -7,6 +7,7 @@
 //!                       sin quedarse encerrado)
 
 mod gpu;
+mod huella;
 mod pam;
 mod ui;
 
@@ -32,7 +33,7 @@ use smithay_client_toolkit::{
     shm::{Shm, ShmHandler, slot::SlotPool},
 };
 use std::time::Duration;
-use ui::{Status, Ui};
+use ui::{Prompt, Status, Ui};
 use wayland_client::{
     Connection, QueueHandle,
     globals::registry_queue_init,
@@ -66,6 +67,10 @@ struct App {
     pass: String,
     status: Status,
     pam_tx: Sender<bool>,
+    /// el hilo de la huella; None: sin huella (o ya se abrió)
+    huella: Option<huella::Huella>,
+    /// el lector está escuchando: la pantalla dice "o huella"
+    dedo: bool,
     exit: Option<i32>,
 }
 
@@ -114,6 +119,8 @@ fn main() {
         pass: String::new(),
         status: Status::Idle,
         pam_tx,
+        huella: None,
+        dedo: false,
         exit: None,
     };
     // los monitores primero, para tener una superficie por cada uno
@@ -140,6 +147,27 @@ fn main() {
         std::process::exit(1);
     };
     app.lock = Some(lock);
+    // la huella, a la par de la contraseña
+    let (huella_tx, huella_rx) = channel::<huella::Aviso>();
+    app.huella = Some(huella::Huella::empezar(huella_tx));
+    event_loop
+        .handle()
+        .insert_source(huella_rx, |ev, _, app| {
+            if let Event::Msg(aviso) = ev {
+                match aviso {
+                    huella::Aviso::Si => return app.unlock(0),
+                    huella::Aviso::Lista => app.dedo = true,
+                    huella::Aviso::No => {
+                        if app.status != Status::Checking {
+                            app.status = Status::Wrong;
+                        }
+                    }
+                    huella::Aviso::Fuera => app.dedo = false,
+                }
+                app.redraw();
+            }
+        })
+        .expect("canal de la huella");
     for output in app.outputs.outputs() {
         app.add_surface(&qh, output);
     }
@@ -184,8 +212,15 @@ fn main() {
     while app.exit.is_none() {
         if event_loop.dispatch(Duration::from_millis(100), &mut app).is_err() {
             // perder Wayland no abre nada: el compositor sigue bloqueado
+            if let Some(h) = app.huella.take() {
+                h.parar();
+            }
             std::process::exit(2);
         }
+    }
+    // process::exit no corre los Drop: que fprintd suelte el lector
+    if let Some(h) = app.huella.take() {
+        h.parar();
     }
     std::process::exit(app.exit.unwrap_or(0));
 }
@@ -209,7 +244,7 @@ impl App {
         }
         let scale = self.scale(&self.surfaces[i].output);
         let (bw, bh) = (w * scale as u32, h * scale as u32);
-        let typed = self.pass.chars().count();
+        let p = Prompt { typed: self.pass.chars().count(), status: self.status, dedo: self.dedo };
         if let Some(gpu) = self.gpu.as_ref() {
             let surf = &mut self.surfaces[i];
             surf.lock.wl_surface().set_buffer_scale(scale);
@@ -218,14 +253,14 @@ impl App {
                 None => surf.target = gpu.target(surf.lock.wl_surface(), bw as i32, bh as i32),
             }
             if let Some(t) = surf.target.as_mut()
-                && let Some(pix) = self.ui.draw(bw, bh, scale as f32, typed, self.status, true)
+                && let Some(pix) = self.ui.draw(bw, bh, scale as f32, p, true)
             {
                 gpu.upload(t, pix.data(), bw as i32, bh as i32);
                 gpu.present(t);
                 return;
             }
         }
-        let Some(pix) = self.ui.draw(bw, bh, scale as f32, typed, self.status, false) else { return };
+        let Some(pix) = self.ui.draw(bw, bh, scale as f32, p, false) else { return };
         let pool = self.pool.get_or_insert_with(|| SlotPool::new((bw * bh * 4) as usize, &self.shm).expect("shm"));
         let Ok((buffer, canvas)) = pool.create_buffer(bw as i32, bh as i32, bw as i32 * 4, wl_shm::Format::Argb8888) else { return };
         // tiny-skia: RGBA premultiplicado → ARGB8888 (en memoria: B G R A)
@@ -257,6 +292,10 @@ impl App {
     }
 
     fn unlock(&mut self, code: i32) {
+        // que fprintd suelte el lector (si se abrió con contraseña)
+        if let Some(h) = self.huella.take() {
+            h.parar();
+        }
         if let Some(lock) = self.lock.take() {
             lock.unlock();
             let _ = self.conn.roundtrip();
