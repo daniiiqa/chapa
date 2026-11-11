@@ -92,6 +92,8 @@ pub struct Target {
     surf: egl::Surface,
     size: (i32, i32),
     tex: Option<glow::Texture>,
+    /// con blur: el video se dibuja aquí en chico y se estira (framebuffer, textura, tamaño)
+    chico: std::cell::Cell<Option<(glow::Framebuffer, glow::Texture, i32, i32)>>,
 }
 
 pub struct Gpu {
@@ -104,6 +106,8 @@ pub struct Gpu {
     /// el reproductor (vive lo que vive la chapa)
     _mpv: *mut c_void,
     render: *mut c_void,
+    /// el blur del look (blur_size × blur_passes de su hyprlock.conf)
+    blur: std::cell::Cell<f32>,
 }
 
 impl Gpu {
@@ -193,14 +197,14 @@ impl Gpu {
             let mut argv: Vec<*const c_char> = cmd.iter().map(|c| c.as_ptr()).collect();
             argv.push(ptr::null());
             mpv_command(mpv, argv.as_mut_ptr());
-            Some(Gpu { display, config, context, gl, prog, vbo, _mpv: mpv, render })
+            Some(Gpu { display, config, context, gl, prog, vbo, _mpv: mpv, render, blur: std::cell::Cell::new(0.0) })
         }
     }
 
     pub fn target(&self, surface: &WlSurface, w: i32, h: i32) -> Option<Target> {
         let win = WlEglSurface::new(surface.id(), w, h).ok()?;
         let surf = unsafe { EGL.create_window_surface(self.display, self.config, win.ptr() as egl::NativeWindowType, None).ok()? };
-        Some(Target { win, surf, size: (w, h), tex: None })
+        Some(Target { win, surf, size: (w, h), tex: None, chico: std::cell::Cell::new(None) })
     }
 
     pub fn resize(&self, t: &mut Target, w: i32, h: i32) {
@@ -276,6 +280,63 @@ impl Gpu {
         Some((w as u32, h as u32, rgb))
     }
 
+    /// El blur del look: blur_size × blur_passes de hyprlock (0: nítido).
+    pub fn set_blur(&self, blur: f32) {
+        self.blur.set(blur.max(0.0));
+    }
+
+    /// Cuánto más chico se dibuja el video para desenfocarlo (1: nada).
+    fn factor(&self) -> i32 {
+        let b = self.blur.get();
+        if b <= 0.0 { 1 } else { (1.0 + b / 3.0).round().clamp(2.0, 12.0) as i32 }
+    }
+
+    /// El framebuffer chico de `t` para el blur (lo crea o lo rehace si cambió
+    /// el tamaño). None: sin blur, o la GPU no pudo.
+    fn chico(&self, t: &Target) -> Option<(glow::Framebuffer, glow::Texture, i32, i32)> {
+        let k = self.factor();
+        if k <= 1 {
+            return None;
+        }
+        let (cw, ch) = ((t.size.0 / k).max(1), (t.size.1 / k).max(1));
+        if let Some(c) = t.chico.get()
+            && (c.2, c.3) == (cw, ch)
+        {
+            return Some(c);
+        }
+        let gl = &self.gl;
+        unsafe {
+            if let Some((fb, tex, _, _)) = t.chico.take() {
+                gl.delete_framebuffer(fb);
+                gl.delete_texture(tex);
+            }
+            let tex = gl.create_texture().ok()?;
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            for p in [glow::TEXTURE_MIN_FILTER, glow::TEXTURE_MAG_FILTER] {
+                gl.tex_parameter_i32(glow::TEXTURE_2D, p, glow::LINEAR as i32);
+            }
+            for p in [glow::TEXTURE_WRAP_S, glow::TEXTURE_WRAP_T] {
+                gl.tex_parameter_i32(glow::TEXTURE_2D, p, glow::CLAMP_TO_EDGE as i32);
+            }
+            gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA as i32, cw, ch, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
+            let fb = gl.create_framebuffer().ok()?;
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fb));
+            gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(tex), 0);
+            let ok = gl.check_framebuffer_status(glow::FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE;
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            if !ok {
+                di!("gpu: el framebuffer del blur no quedó; sin blur");
+                gl.delete_framebuffer(fb);
+                gl.delete_texture(tex);
+                self.blur.set(0.0);
+                return None;
+            }
+            di!("gpu: blur ×{k} ({cw}x{ch})");
+            t.chico.set(Some((fb, tex, cw, ch)));
+            Some((fb, tex, cw, ch))
+        }
+    }
+
     /// mpv y la capa de texto en el framebuffer de `t`, sin mostrarlo. None si
     /// no se pudo usar su superficie; si no, lo que dijo mpv.
     fn dibuja(&self, t: &Target) -> Option<c_int> {
@@ -287,7 +348,16 @@ impl Gpu {
                 return None;
             }
             let _ = EGL.swap_interval(self.display, 0);
-            let mut fbo = Fbo { fbo: 0, w, h, internal_format: 0 };
+            // con blur, mpv dibuja en chico (en una textura) y luego se estira
+            // con filtro lineal: un desenfoque suave casi gratis
+            let chico = self.chico(t);
+            let (destino, dw, dh) = match chico {
+                Some((fb, _, cw, ch)) => (fb.0.get() as c_int, cw, ch),
+                None => (0, w, h),
+            };
+            let mut fbo = Fbo { fbo: destino, w: dw, h: dh, internal_format: 0 };
+            // con flip, la fila de arriba de la imagen queda en la fila 0: así la
+            // muestra bien el framebuffer de la pantalla y también el shader
             let mut flip: c_int = 1;
             let mut params = [
                 Param { kind: P_FBO, data: &mut fbo as *mut Fbo as *mut c_void },
@@ -295,6 +365,18 @@ impl Gpu {
                 Param { kind: P_INVALID, data: ptr::null_mut() },
             ];
             let r = mpv_render_context_render(self.render, params.as_mut_ptr());
+            if let Some((_, tex, _, _)) = chico {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                gl.viewport(0, 0, w, h);
+                gl.use_program(Some(self.prog));
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
+                gl.enable_vertex_attrib_array(0);
+                gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 0, 0);
+                gl.active_texture(glow::TEXTURE0);
+                gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                gl.disable(glow::BLEND);
+                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            }
             // mpv deja el estado de GL a su gusto: ponerlo todo de nuevo
             if let Some(tex) = t.tex {
                 gl.bind_framebuffer(glow::FRAMEBUFFER, None);

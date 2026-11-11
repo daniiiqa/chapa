@@ -15,8 +15,11 @@ macro_rules! di {
     }};
 }
 
+mod estilo;
 mod gpu;
 mod huella;
+mod lienzo;
+mod muestra;
 mod pam;
 mod telon;
 mod ui;
@@ -73,6 +76,12 @@ struct App {
     surfaces: Vec<Surf>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     ui: Ui,
+    /// el estilo del look (su hyprlock.conf); None: el dibujo de siempre
+    lienzo: Option<lienzo::Lienzo>,
+    /// bloq mayús prendido (la entrada lo enseña con capslock_color)
+    mayus: bool,
+    /// contraseñas y dedos que no fueron ($ATTEMPTS)
+    intentos: u32,
     user: String,
     pass: pam::Secreto,
     status: Status,
@@ -99,6 +108,10 @@ fn user() -> String {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // una imagen de cómo se ve, sin bloquear nada
+    if args.iter().any(|a| a == "--muestra") {
+        std::process::exit(muestra::correr(&args));
+    }
     let prueba: Option<u64> = args.iter().position(|a| a == "--prueba").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok());
 
     let conn = match Connection::connect_to_env() {
@@ -128,6 +141,9 @@ fn main() {
         surfaces: Vec::new(),
         keyboard: None,
         ui: Ui::new(),
+        lienzo: None,
+        mayus: false,
+        intentos: 0,
         user: user(),
         pass: pam::Secreto::new(),
         status: Status::Idle,
@@ -145,7 +161,13 @@ fn main() {
     let (ping, ping_src) = make_ping().expect("ping");
     let source = gpu::wallpaper();
     di!("arranca: fondo {source}");
+    // el estilo del look: el mismo hyprlock.conf (hyprlock de repuesto se ve igual)
+    app.lienzo = estilo::cargar(&estilo::vivo(), None).map(|e| lienzo::Lienzo::new(e, app.user.clone()));
+    di!("estilo: {}", if app.lienzo.is_some() { "el del look (hyprlock.conf)" } else { "el de siempre" });
     app.gpu = gpu::Gpu::new(conn.backend().display_ptr() as *mut std::ffi::c_void, &source, ping);
+    if let (Some(g), Some(l)) = (app.gpu.as_ref(), app.lienzo.as_ref()) {
+        g.set_blur(l.estilo.fondo.blur);
+    }
     if app.gpu.is_none() {
         di!("sin EGL/mpv, fondo sólido");
     }
@@ -175,6 +197,7 @@ fn main() {
                     huella::Aviso::Si => return app.unlock(0),
                     huella::Aviso::Lista => app.dedo = true,
                     huella::Aviso::No => {
+                        app.intentos += 1;
                         if app.status != Status::Checking {
                             app.status = Status::Wrong;
                         }
@@ -200,6 +223,7 @@ fn main() {
                 if ok {
                     app.unlock(0);
                 } else {
+                    app.intentos += 1;
                     app.status = Status::Wrong;
                     app.redraw();
                 }
@@ -267,23 +291,23 @@ impl App {
         }
         let scale = self.scale(&self.surfaces[i].output);
         let (bw, bh) = (w * scale as u32, h * scale as u32);
-        let p = Prompt { typed: self.pass.letras(), status: self.status, dedo: self.dedo };
-        if let Some(gpu) = self.gpu.as_ref() {
+        if self.gpu.is_some() {
+            // primero el cuadro (pinta con &mut self), luego la gpu
+            let pix = self.pintar(bw, bh, scale as f32, true);
+            let gpu = self.gpu.as_ref().expect("hay gpu");
             let surf = &mut self.surfaces[i];
             surf.lock.wl_surface().set_buffer_scale(scale);
             match surf.target.as_mut() {
                 Some(t) => gpu.resize(t, bw as i32, bh as i32),
                 None => surf.target = gpu.target(surf.lock.wl_surface(), bw as i32, bh as i32),
             }
-            if let Some(t) = surf.target.as_mut()
-                && let Some(pix) = self.ui.draw(bw, bh, scale as f32, p, true)
-            {
+            if let (Some(t), Some(pix)) = (surf.target.as_mut(), pix) {
                 gpu.upload(t, pix.data(), bw as i32, bh as i32);
                 gpu.present(t);
                 return;
             }
         }
-        let Some(pix) = self.ui.draw(bw, bh, scale as f32, p, false) else { return };
+        let Some(pix) = self.pintar(bw, bh, scale as f32, false) else { return };
         let pool = self.pool.get_or_insert_with(|| SlotPool::new((bw * bh * 4) as usize, &self.shm).expect("shm"));
         let Ok((buffer, canvas)) = pool.create_buffer(bw as i32, bh as i32, bw as i32 * 4, wl_shm::Format::Argb8888) else { return };
         // tiny-skia: RGBA premultiplicado → ARGB8888 (en memoria: B G R A)
@@ -354,10 +378,24 @@ impl App {
         let (w, h) = self.surfaces[i].size;
         let scale = self.scale(&self.surfaces[i].output);
         let (bw, bh) = (w * scale as u32, h * scale as u32);
-        let p = Prompt { typed: self.pass.letras(), status: self.status, dedo: self.dedo };
-        let pix = self.ui.draw(bw, bh, scale as f32, p, false)?;
+        let pix = self.pintar(bw, bh, scale as f32, false)?;
         let rgb = pix.data().as_chunks::<4>().0.iter().flat_map(|c| [c[0], c[1], c[2]]).collect();
         Some((bw, bh, rgb))
+    }
+
+    /// El cuadro de un monitor: con el estilo del look (su hyprlock.conf) si se
+    /// pudo leer; si no, el de siempre. `encima`: va sobre el video.
+    fn pintar(&mut self, bw: u32, bh: u32, s: f32, encima: bool) -> Option<tiny_skia::Pixmap> {
+        match self.lienzo.as_mut() {
+            Some(l) => {
+                let e = lienzo::Estado { letras: self.pass.letras(), status: self.status, dedo: self.dedo, mayus: self.mayus, intentos: self.intentos };
+                l.dibujar(bw, bh, s, &e, encima)
+            }
+            None => {
+                let p = Prompt { typed: self.pass.letras(), status: self.status, dedo: self.dedo };
+                self.ui.draw(bw, bh, s, p, encima)
+            }
+        }
     }
 
     fn submit(&mut self) {
@@ -417,7 +455,12 @@ impl KeyboardHandler for App {
 
     fn release_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, _: KeyEvent) {}
 
-    fn update_modifiers(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, _: Modifiers, _: RawModifiers, _: u32) {}
+    fn update_modifiers(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, m: Modifiers, _: RawModifiers, _: u32) {
+        if m.caps_lock != self.mayus {
+            self.mayus = m.caps_lock;
+            self.redraw();
+        }
+    }
 }
 
 impl App {
