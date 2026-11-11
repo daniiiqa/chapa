@@ -248,11 +248,43 @@ impl Gpu {
 
     /// Un cuadro: el wallpaper de mpv y la capa de texto encima.
     pub fn present(&self, t: &Target) {
+        let Some(r) = self.dibuja(t) else { return };
+        unsafe {
+            let swap = EGL.swap_buffers(self.display, t.surf);
+            mpv_render_context_report_swap(self.render);
+            match (r, swap) {
+                (_, Err(e)) => estado(2, || format!("swap falló: {e:?}")),
+                (r, _) if r < 0 => estado(3, || format!("mpv no dibujó ({r})")),
+                _ => estado(0, || "dibuja bien otra vez".into()),
+            }
+        }
+    }
+
+    /// El cuadro de ahora, en RGB y de arriba abajo (para el telón de farula
+    /// al abrir). Se dibuja otra vez sin mostrarlo y se lee de vuelta.
+    pub fn captura(&self, t: &Target) -> Option<(u32, u32, Vec<u8>)> {
+        self.dibuja(t)?;
+        let (w, h) = t.size;
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        unsafe {
+            self.gl.pixel_store_i32(glow::PACK_ALIGNMENT, 4);
+            self.gl.read_pixels(0, 0, w, h, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelPackData::Slice(Some(&mut rgba)));
+        }
+        // GL lee de abajo arriba
+        let fila = (w * 4) as usize;
+        let rgb = rgba.chunks_exact(fila).rev().flat_map(|f| f.as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]])).collect();
+        Some((w as u32, h as u32, rgb))
+    }
+
+    /// mpv y la capa de texto en el framebuffer de `t`, sin mostrarlo. None si
+    /// no se pudo usar su superficie; si no, lo que dijo mpv.
+    fn dibuja(&self, t: &Target) -> Option<c_int> {
         let gl = &self.gl;
         let (w, h) = t.size;
         unsafe {
             if let Err(e) = EGL.make_current(self.display, Some(t.surf), Some(t.surf), Some(self.context)) {
-                return estado(1, || format!("make_current falló: {e:?}"));
+                estado(1, || format!("make_current falló: {e:?}"));
+                return None;
             }
             let _ = EGL.swap_interval(self.display, 0);
             let mut fbo = Fbo { fbo: 0, w, h, internal_format: 0 };
@@ -278,13 +310,7 @@ impl Gpu {
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
                 gl.disable(glow::BLEND);
             }
-            let swap = EGL.swap_buffers(self.display, t.surf);
-            mpv_render_context_report_swap(self.render);
-            match (r, swap) {
-                (_, Err(e)) => estado(2, || format!("swap falló: {e:?}")),
-                (r, _) if r < 0 => estado(3, || format!("mpv no dibujó ({r})")),
-                _ => estado(0, || "dibuja bien otra vez".into()),
-            }
+            Some(r)
         }
     }
 }

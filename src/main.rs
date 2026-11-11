@@ -18,6 +18,7 @@ macro_rules! di {
 mod gpu;
 mod huella;
 mod pam;
+mod telon;
 mod ui;
 
 use smithay_client_toolkit::{
@@ -286,8 +287,8 @@ impl App {
         let pool = self.pool.get_or_insert_with(|| SlotPool::new((bw * bh * 4) as usize, &self.shm).expect("shm"));
         let Ok((buffer, canvas)) = pool.create_buffer(bw as i32, bh as i32, bw as i32 * 4, wl_shm::Format::Argb8888) else { return };
         // tiny-skia: RGBA premultiplicado → ARGB8888 (en memoria: B G R A)
-        for (d, s) in canvas.chunks_exact_mut(4).zip(pix.data().chunks_exact(4)) {
-            d.copy_from_slice(&[s[2], s[1], s[0], s[3]]);
+        for (d, s) in canvas.as_chunks_mut::<4>().0.iter_mut().zip(pix.data().as_chunks::<4>().0) {
+            *d = [s[2], s[1], s[0], s[3]];
         }
         let surf = self.surfaces[i].lock.wl_surface();
         surf.set_buffer_scale(scale);
@@ -320,11 +321,43 @@ impl App {
         if let Some(h) = self.huella.take() {
             h.parar();
         }
+        // el telón de farula debajo, con lo último que se vio (solo al abrir de
+        // verdad; nunca detiene la apertura)
+        let telon = code == 0 && self.lock.is_some() && self.poner_telon();
         if let Some(lock) = self.lock.take() {
             lock.unlock();
             let _ = self.conn.roundtrip();
         }
+        if telon {
+            telon::revelar();
+        }
         self.exit = Some(code);
+    }
+
+    fn poner_telon(&mut self) -> bool {
+        let Some((w, h, rgb)) = self.captura() else {
+            di!("telón: sin cuadro que capturar");
+            return false;
+        };
+        let puesto = telon::poner(w, h, &rgb);
+        di!("telón de farula: {}", if puesto { "puesto" } else { "no (se abre sin efecto)" });
+        puesto
+    }
+
+    /// Lo que se ve ahorita en el primer monitor, en RGB.
+    fn captura(&mut self) -> Option<(u32, u32, Vec<u8>)> {
+        let i = self.surfaces.iter().position(|s| s.size.0 > 0 && s.size.1 > 0)?;
+        if let (Some(gpu), Some(t)) = (self.gpu.as_ref(), self.surfaces[i].target.as_ref()) {
+            return gpu.captura(t);
+        }
+        // sin EGL: el mismo cuadro que se dibuja en shm (fondo sólido, opaco)
+        let (w, h) = self.surfaces[i].size;
+        let scale = self.scale(&self.surfaces[i].output);
+        let (bw, bh) = (w * scale as u32, h * scale as u32);
+        let p = Prompt { typed: self.pass.letras(), status: self.status, dedo: self.dedo };
+        let pix = self.ui.draw(bw, bh, scale as f32, p, false)?;
+        let rgb = pix.data().as_chunks::<4>().0.iter().flat_map(|c| [c[0], c[1], c[2]]).collect();
+        Some((bw, bh, rgb))
     }
 
     fn submit(&mut self) {
