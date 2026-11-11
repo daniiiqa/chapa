@@ -6,6 +6,15 @@
 //!   chapa --prueba N    bloquear y abrir sola a los N segundos (para probar
 //!                       sin quedarse encerrado)
 
+/// Una línea al log, con la hora: LockScreen.sh manda el stderr de chapa a
+/// ~/.local/state/chapa/chapa.log (el log de Hyprland se borra al apagar).
+macro_rules! di {
+    ($($t:tt)*) => {{
+        let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_millis()).unwrap_or(0);
+        eprintln!("{}.{:03} chapa: {}", crate::ui::now("%H:%M:%S"), ms, format!($($t)*));
+    }};
+}
+
 mod gpu;
 mod huella;
 mod pam;
@@ -71,6 +80,9 @@ struct App {
     huella: Option<huella::Huella>,
     /// el lector está escuchando: la pantalla dice "o huella"
     dedo: bool,
+    /// cuadros de mpv dibujados y segundos del reloj, para el latido del log
+    cuadros: u64,
+    ticks: u32,
     exit: Option<i32>,
 }
 
@@ -91,7 +103,7 @@ fn main() {
     let conn = match Connection::connect_to_env() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("chapa: sin Wayland ({e})");
+            di!("sin Wayland ({e})");
             std::process::exit(1);
         }
     };
@@ -121,6 +133,8 @@ fn main() {
         pam_tx,
         huella: None,
         dedo: false,
+        cuadros: 0,
+        ticks: 0,
         exit: None,
     };
     // los monitores primero, para tener una superficie por cada uno
@@ -129,9 +143,10 @@ fn main() {
     // el wallpaper (video o imagen) con mpv sobre EGL; sin eso, fondo sólido
     let (ping, ping_src) = make_ping().expect("ping");
     let source = gpu::wallpaper();
+    di!("arranca: fondo {source}");
     app.gpu = gpu::Gpu::new(conn.backend().display_ptr() as *mut std::ffi::c_void, &source, ping);
     if app.gpu.is_none() {
-        eprintln!("chapa: sin EGL/mpv, fondo sólido");
+        di!("sin EGL/mpv, fondo sólido");
     }
     event_loop
         .handle()
@@ -143,7 +158,7 @@ fn main() {
         .expect("cuadros de mpv");
 
     let Ok(lock) = app.lock_state.lock(&qh) else {
-        eprintln!("chapa: el compositor no tiene ext-session-lock");
+        di!("el compositor no tiene ext-session-lock");
         std::process::exit(1);
     };
     app.lock = Some(lock);
@@ -154,6 +169,7 @@ fn main() {
         .handle()
         .insert_source(huella_rx, |ev, _, app| {
             if let Event::Msg(aviso) = ev {
+                di!("huella: {aviso:?}");
                 match aviso {
                     huella::Aviso::Si => return app.unlock(0),
                     huella::Aviso::Lista => app.dedo = true,
@@ -179,6 +195,7 @@ fn main() {
         .handle()
         .insert_source(pam_rx, |ev, _, app| {
             if let Event::Msg(ok) = ev {
+                di!("PAM: {}", if ok { "sí" } else { "no" });
                 if ok {
                     app.unlock(0);
                 } else {
@@ -193,6 +210,11 @@ fn main() {
     event_loop
         .handle()
         .insert_source(Timer::from_duration(Duration::from_secs(1)), |_, _, app| {
+            // el latido: si la pantalla se ve negra, ¿chapa sigue viva y dibujando?
+            app.ticks += 1;
+            if app.ticks % 10 == 0 {
+                di!("viva: {} cuadros, {} superficies", app.cuadros, app.surfaces.len());
+            }
             app.redraw();
             TimeoutAction::ToDuration(Duration::from_secs(1))
         })
@@ -202,7 +224,7 @@ fn main() {
         event_loop
             .handle()
             .insert_source(Timer::from_duration(Duration::from_secs(n)), |_, _, app| {
-                eprintln!("chapa: --prueba, se abre sola");
+                di!("--prueba, se abre sola");
                 app.unlock(0);
                 TimeoutAction::Drop
             })
@@ -277,6 +299,7 @@ impl App {
 
     /// Un cuadro nuevo del wallpaper en cada superficie (la capa de texto no cambia).
     fn present_all(&mut self) {
+        self.cuadros += 1;
         let Some(gpu) = self.gpu.as_ref() else { return };
         for s in &self.surfaces {
             if let Some(t) = &s.target {
@@ -292,6 +315,7 @@ impl App {
     }
 
     fn unlock(&mut self, code: i32) {
+        di!("abre ({code})");
         // que fprintd suelte el lector (si se abrió con contraseña)
         if let Some(h) = self.huella.take() {
             h.parar();
@@ -307,6 +331,7 @@ impl App {
         if self.status == Status::Checking || self.pass.is_empty() {
             return;
         }
+        di!("revisando contraseña");
         self.status = Status::Checking;
         let (user, pass, tx) = (self.user.clone(), self.pass.take(), self.pam_tx.clone());
         std::thread::spawn(move || {
@@ -320,6 +345,7 @@ impl App {
 
 impl SessionLockHandler for App {
     fn locked(&mut self, _: &Connection, _: &QueueHandle<Self>, _: SessionLock) {
+        di!("bloqueada");
         self.locked = true;
     }
 
@@ -327,12 +353,13 @@ impl SessionLockHandler for App {
         // el compositor no nos dejó bloquear (ya hay otra chapa) o nos quitó el
         // bloqueo. Nunca 0: 0 es «se abrió con la contraseña o la huella», y con
         // cualquier otro LockScreen.sh pone hyprlock por si acaso.
-        eprintln!("chapa: el compositor no dejó bloquear o quitó el bloqueo");
+        di!("el compositor no dejó bloquear o quitó el bloqueo");
         self.exit = Some(if self.locked { 3 } else { 1 });
     }
 
     fn configure(&mut self, _: &Connection, _: &QueueHandle<Self>, surface: SessionLockSurface, cfg: SessionLockSurfaceConfigure, _: u32) {
         if let Some(i) = self.surfaces.iter().position(|s| s.lock.wl_surface() == surface.wl_surface()) {
+            di!("superficie {i}: {}x{}", cfg.new_size.0, cfg.new_size.1);
             self.surfaces[i].size = cfg.new_size;
             self.draw(i);
         }
@@ -340,8 +367,12 @@ impl SessionLockHandler for App {
 }
 
 impl KeyboardHandler for App {
-    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32, _: &[u32], _: &[Keysym]) {}
-    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32) {}
+    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32, _: &[u32], _: &[Keysym]) {
+        di!("teclado: entra");
+    }
+    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32) {
+        di!("teclado: sale");
+    }
 
     fn press_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, ev: KeyEvent) {
         self.key(ev);
@@ -386,6 +417,7 @@ impl SeatHandler for App {
     fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
     fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat, cap: Capability) {
         if cap == Capability::Keyboard && self.keyboard.is_none() {
+            di!("teclado listo");
             self.keyboard = self.seats.get_keyboard(qh, &seat, None).ok();
         }
     }
@@ -414,6 +446,7 @@ impl OutputHandler for App {
         &mut self.outputs
     }
     fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        di!("monitor nuevo");
         // un monitor que se conecta con la sesión bloqueada también se tapa
         if self.lock.is_some() && !self.surfaces.iter().any(|s| s.output == output) {
             self.add_surface(qh, output);
@@ -421,6 +454,7 @@ impl OutputHandler for App {
     }
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
     fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        di!("monitor se fue");
         self.surfaces.retain(|s| s.output != output);
     }
 }

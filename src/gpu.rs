@@ -56,6 +56,18 @@ unsafe extern "C" {
 
 static EGL: egl::Instance<egl::Static> = egl::Instance::new(egl::Static);
 
+use std::sync::atomic::{AtomicU8, Ordering};
+
+/// Cómo le fue al último cuadro (0 bien, 1 make_current, 2 swap, 3 mpv). Al log
+/// solo cuando cambia: si no, serían 60 líneas por segundo.
+static ESTADO: AtomicU8 = AtomicU8::new(0);
+
+fn estado(nuevo: u8, que: impl FnOnce() -> String) {
+    if ESTADO.swap(nuevo, Ordering::Relaxed) != nuevo {
+        di!("gpu: {}", que());
+    }
+}
+
 extern "C" fn proc_address(_: *mut c_void, name: *const c_char) -> *mut c_void {
     let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_str().unwrap_or("");
     EGL.get_proc_address(name).map_or(ptr::null_mut(), |f| f as *mut c_void)
@@ -121,7 +133,7 @@ impl Gpu {
                 gl.shader_source(sh, src);
                 gl.compile_shader(sh);
                 if !gl.get_shader_compile_status(sh) {
-                    eprintln!("chapa: shader: {}", gl.get_shader_info_log(sh));
+                    di!("shader: {}", gl.get_shader_info_log(sh));
                     return None;
                 }
                 gl.attach_shader(prog, sh);
@@ -140,6 +152,16 @@ impl Gpu {
             let mpv = mpv_create();
             if mpv.is_null() {
                 return None;
+            }
+            // CHAPA_DEBUG=1 (o el archivo ~/.local/state/chapa/debug, para cuando la
+            // lanza hypridle): mpv cuenta todo en ~/.local/state/chapa/mpv.log
+            let estado_dir = format!("{}/.local/state/chapa", std::env::var("HOME").unwrap_or_default());
+            if std::env::var_os("CHAPA_DEBUG").is_some() || std::path::Path::new(&format!("{estado_dir}/debug")).exists() {
+                let log = format!("{estado_dir}/mpv.log");
+                for (k, v) in [("log-file", log.as_str()), ("msg-level", "all=v")] {
+                    let (k, v) = (CString::new(k).unwrap(), CString::new(v).unwrap());
+                    mpv_set_option_string(mpv, k.as_ptr(), v.as_ptr());
+                }
             }
             for (k, v) in [
                 ("vo", "libmpv"), ("hwdec", "auto-safe"), ("audio", "no"), ("loop-file", "inf"), ("keep-open", "yes"),
@@ -162,7 +184,7 @@ impl Gpu {
             ];
             let mut render = ptr::null_mut();
             if mpv_render_context_create(&mut render, mpv, params.as_mut_ptr()) < 0 {
-                eprintln!("chapa: mpv no pudo usar OpenGL");
+                di!("mpv no pudo usar OpenGL");
                 return None;
             }
             let ping = Box::into_raw(Box::new(ping));
@@ -229,8 +251,8 @@ impl Gpu {
         let gl = &self.gl;
         let (w, h) = t.size;
         unsafe {
-            if EGL.make_current(self.display, Some(t.surf), Some(t.surf), Some(self.context)).is_err() {
-                return;
+            if let Err(e) = EGL.make_current(self.display, Some(t.surf), Some(t.surf), Some(self.context)) {
+                return estado(1, || format!("make_current falló: {e:?}"));
             }
             let _ = EGL.swap_interval(self.display, 0);
             let mut fbo = Fbo { fbo: 0, w, h, internal_format: 0 };
@@ -240,7 +262,7 @@ impl Gpu {
                 Param { kind: P_FLIP_Y, data: &mut flip as *mut c_int as *mut c_void },
                 Param { kind: P_INVALID, data: ptr::null_mut() },
             ];
-            mpv_render_context_render(self.render, params.as_mut_ptr());
+            let r = mpv_render_context_render(self.render, params.as_mut_ptr());
             // mpv deja el estado de GL a su gusto: ponerlo todo de nuevo
             if let Some(tex) = t.tex {
                 gl.bind_framebuffer(glow::FRAMEBUFFER, None);
@@ -256,8 +278,13 @@ impl Gpu {
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
                 gl.disable(glow::BLEND);
             }
-            let _ = EGL.swap_buffers(self.display, t.surf);
+            let swap = EGL.swap_buffers(self.display, t.surf);
             mpv_render_context_report_swap(self.render);
+            match (r, swap) {
+                (_, Err(e)) => estado(2, || format!("swap falló: {e:?}")),
+                (r, _) if r < 0 => estado(3, || format!("mpv no dibujó ({r})")),
+                _ => estado(0, || "dibuja bien otra vez".into()),
+            }
         }
     }
 }
