@@ -62,6 +62,59 @@ extern "C" fn converse(n: c_int, msgs: *mut *const Message, out: *mut *mut Respo
     PAM_SUCCESS
 }
 
+/// Cuánto cabe: con todo el lugar apartado desde el principio, la contraseña
+/// nunca se copia a otro lado al crecer (y deja una copia vieja en memoria).
+const LUGAR: usize = 512;
+
+/// La contraseña mientras se escribe. Lo que se quita (borrar, Esc, al
+/// soltarla) se pone en ceros, no nomás se olvida.
+pub struct Secreto(String);
+
+impl Secreto {
+    pub fn new() -> Secreto {
+        Secreto(String::with_capacity(LUGAR))
+    }
+
+    pub fn letras(&self) -> usize {
+        self.0.chars().count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Lo que no cabe se ignora: crecer sería copiar.
+    pub fn push_str(&mut self, t: &str) {
+        if self.0.len() + t.len() <= LUGAR {
+            self.0.push_str(t);
+        }
+    }
+
+    pub fn pop(&mut self) {
+        let antes = self.0.len();
+        self.0.pop();
+        let ahora = self.0.len();
+        // los bytes de la letra quitada siguen en el buffer: ceros
+        unsafe { libc::explicit_bzero(self.0.as_mut_ptr().add(ahora) as *mut c_void, antes - ahora) };
+    }
+
+    pub fn clear(&mut self) {
+        unsafe { libc::explicit_bzero(self.0.as_mut_ptr() as *mut c_void, self.0.len()) };
+        self.0.clear();
+    }
+
+    /// Para mandarla a revisar: `check` la borra al terminar.
+    pub fn take(&mut self) -> String {
+        std::mem::replace(&mut self.0, String::with_capacity(LUGAR))
+    }
+}
+
+impl Drop for Secreto {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
 fn service() -> &'static str {
     if std::path::Path::new("/etc/pam.d/chapa").exists() { "chapa" } else { "hyprlock" }
 }
@@ -98,6 +151,25 @@ pub fn check(user: &str, mut pass: String) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::Secreto;
+
+    #[test]
+    fn secreto_no_crece_ni_deja_rastro() {
+        let mut s = Secreto::new();
+        let lugar = s.0.capacity();
+        s.push_str("ñandú");
+        s.pop();
+        assert_eq!(s.letras(), 4);
+        // la "ú" quitada quedó en ceros, más allá del largo
+        let crudo = unsafe { std::slice::from_raw_parts(s.0.as_ptr(), 7) };
+        assert_eq!(&crudo[5..], &[0, 0]);
+        s.push_str(&"x".repeat(2000));
+        assert_eq!(s.0.capacity(), lugar, "no se copió a otro lado");
+        assert_eq!(s.letras(), 4);
+        assert_eq!(s.take(), "ñand");
+        assert!(s.is_empty());
+    }
+
     #[test]
     fn mala_no_abre() {
         let user = std::env::var("USER").unwrap();

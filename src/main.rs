@@ -64,7 +64,7 @@ struct App {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     ui: Ui,
     user: String,
-    pass: String,
+    pass: pam::Secreto,
     status: Status,
     pam_tx: Sender<bool>,
     /// el hilo de la huella; None: sin huella (o ya se abrió)
@@ -116,7 +116,7 @@ fn main() {
         keyboard: None,
         ui: Ui::new(),
         user: user(),
-        pass: String::new(),
+        pass: pam::Secreto::new(),
         status: Status::Idle,
         pam_tx,
         huella: None,
@@ -244,7 +244,7 @@ impl App {
         }
         let scale = self.scale(&self.surfaces[i].output);
         let (bw, bh) = (w * scale as u32, h * scale as u32);
-        let p = Prompt { typed: self.pass.chars().count(), status: self.status, dedo: self.dedo };
+        let p = Prompt { typed: self.pass.letras(), status: self.status, dedo: self.dedo };
         if let Some(gpu) = self.gpu.as_ref() {
             let surf = &mut self.surfaces[i];
             surf.lock.wl_surface().set_buffer_scale(scale);
@@ -308,9 +308,11 @@ impl App {
             return;
         }
         self.status = Status::Checking;
-        let (user, pass, tx) = (self.user.clone(), std::mem::take(&mut self.pass), self.pam_tx.clone());
+        let (user, pass, tx) = (self.user.clone(), self.pass.take(), self.pam_tx.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(pam::check(&user, pass));
+            // si PAM se cae, es un no (y la chapa no se queda en «…» para siempre)
+            let ok = std::panic::catch_unwind(move || pam::check(&user, pass)).unwrap_or(false);
+            let _ = tx.send(ok);
         });
         self.redraw();
     }
@@ -322,9 +324,11 @@ impl SessionLockHandler for App {
     }
 
     fn finished(&mut self, _: &Connection, _: &QueueHandle<Self>, _: SessionLock) {
-        // el compositor no nos dejó bloquear (ya hay otra chapa) o nos quitó
-        eprintln!("chapa: el compositor no dejó bloquear");
-        self.exit = Some(if self.locked { 0 } else { 1 });
+        // el compositor no nos dejó bloquear (ya hay otra chapa) o nos quitó el
+        // bloqueo. Nunca 0: 0 es «se abrió con la contraseña o la huella», y con
+        // cualquier otro LockScreen.sh pone hyprlock por si acaso.
+        eprintln!("chapa: el compositor no dejó bloquear o quitó el bloqueo");
+        self.exit = Some(if self.locked { 3 } else { 1 });
     }
 
     fn configure(&mut self, _: &Connection, _: &QueueHandle<Self>, surface: SessionLockSurface, cfg: SessionLockSurfaceConfigure, _: u32) {
